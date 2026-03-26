@@ -47,6 +47,8 @@ class WandBConfig:
     notes: str | None = None
     run_id: str | None = None
     mode: str | None = None  # Allowed values: 'online', 'offline' 'disabled'. Defaults to 'online'
+    # WandB API key. If set, overrides the WANDB_API_KEY environment variable.
+    api_key: str | None = None
 
 
 @dataclass

@@ -85,6 +85,10 @@ class WandBLogger:
         os.environ["WANDB_SILENT"] = "True"
         import wandb
 
+        # Allow API key to be provided directly in the config (overrides env var)
+        if getattr(self.cfg, "api_key", None):
+            os.environ["WANDB_API_KEY"] = self.cfg.api_key
+
         wandb_run_id = (
             cfg.wandb.run_id
             if cfg.wandb.run_id
