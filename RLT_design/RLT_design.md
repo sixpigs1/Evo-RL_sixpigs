@@ -136,6 +136,7 @@ Online RL 算法具体步骤如下：
 - 如果现在已有的代码和我们的算法设计不兼容，你可以根据文件结构在对应的地方重写一个代码，尽量不要修改原来的代码格式。
 - 你需要查看 requirements-ubuntu.txt 等文件来查看这个项目的依赖，写代码的时候需要注意需要尽量兼容这里面的版本
 - 你也需要查看 setup.py 和 pyproject.toml 等文件，确保我们的依赖可以通过 `pip install -e .` 来全部安装，需要运行的脚本也可以
+- 由于是复现，可能会遇到各种参数设置不合理，代码有问题等情况。请尽可能记录可能对于参数设置有帮助的信息，以便后续的调试和优化。
 
 ### 参考参数
 
@@ -153,3 +154,29 @@ Online RL 算法具体步骤如下：
   - Encoder Transformer: 4 layers, hidden dimension 512, attention heads 8
   - Decoder Transformer: 2 layers, hidden dimension 512
   - Mode Switch MLP: 2 layers, hidden dimension 256
+
+-----------------------------------------
+
+## 可能还需要修改的地方
+
+我查看了你的代码，完成的很好，但是可以考虑再去检查这些地方：
+
+- 因为这个复现中很多参数都尚不清楚，代码也可能有问题。所以需要进行广泛的测试，请检查你的代码确保训练过程等关键数据被记录下来并可以上传到 wandb 等平台进行查看。例如有些 loss 由两部分组成的时候(例如: joint training of VLA and encoder-decoder; actor training)你可以在原有总和 loss 的基础上分别记录两个部分的 loss 来帮助我检查每个部分的训练效果。另外，其他代码也可以提供 --debug 模式来输出一些必要的细节。
+- 为了方便我调试等，请你写一个 .md 文档来解释每个模型的参数的情况，简要解释每个参数的作用。
+- online RL 是整个流程的核心部分，请具体检查下面这些问题
+  - 你需要注意：并不是整一个执行阶段都是需要 RL 的。所以你需要添加一个按键来控制进入和退出 需要RL 阶段。
+  - 你在 online RL 阶段似乎加载了 mode switch MLP 的参数, 你有进行训练吗？这个训练似乎是不必要的，因为我们安排了单独对这个模块进行训练的脚本。
+  - 为了方便 intervention 的进行，即使还没有处于 intervention 状态, teleoperator 应该跟随 robot 一起动, RECAP 中的 src/lerobot/scripts/lerobot_human_inloop_record.py 可能有相关实现，你可以去查看一下
+  - 在按下 space 按键以后是会直接结束 episode, 并标记为 success(reward +1) 吗？可能还需要考虑 1. 结束 episodes 以后让机械臂恢复到操控的初始位置；2. 提供一个按键来结束 episode 并标记为 failure (reward 0)。另外，如果超时自动标记为 failure。
+  - 结束 episode 的时候最好可以自动将 teleoperators 和 robots 恢复到初始位置。
+  - 我们的 online RL 需要兼容双臂，请检查。
+- 关于 online RL 的数据收集，你需要注意：
+  - 对于 mode switch MLP training 的数据，你需要在整个 episode 记录每一帧的数据，如果现在正处于 RL 数据收集阶段，则 是否RL 标记为 1，否则标记为 0。这个 0/1 是 mode switch MLP 的学习目标。 
+  - 对于放入 replay buffer 的数据，你需要进行 subsample。即在 需要RL 阶段中，你应该每隔 2(这应当是一个可以控制的参数) 个时间戳记录一个数据，i.e. (0, C), (2, C+2), (4, C+4), ...
+  - 格式：我注意到在保存 mode switch 数据时候也添加了后缀，但是这似乎是没有必要的。这些数据和 checkpoint 不一样，应当直
+  - 0.接一起存储。在保存数据的时候现在比较混乱，我们可以采取一个统一的格式来保存。例如：
+    data_path
+    - meta.json - 放一些基本的信息，比如使用了什么机械臂，各种数据的 dim，数据量 等。由你来定义这个 .json 数据
+    - play_buffer.pkl
+    - mode_switch.pkl
+- 完成所有更新以后别忘了更新 README_RLT.md 文件中对应的地方。

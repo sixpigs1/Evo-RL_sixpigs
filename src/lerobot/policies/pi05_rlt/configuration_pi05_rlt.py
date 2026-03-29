@@ -96,6 +96,10 @@ class PI05RLTConfig(PI05Config):
     rl_batch_size: int = 256
     updates_per_step: int = 5          # G: update-to-data ratio
 
+    # Training control flags (used by lerobot_train_rlt.py)
+    freeze_vla: bool = False           # Freeze VLA parameters, only train RL Token encoder/decoder
+    freeze_rlt: bool = False           # Freeze RL Token encoder/decoder, only fine-tune VLA
+
     def __post_init__(self):
         super().__post_init__()
         # chunk_size_rl must be <= chunk_size

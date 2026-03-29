@@ -159,16 +159,17 @@ def update_policy_rlt(
 
 
 @parser.wrap()
-def train_rlt(cfg: TrainPipelineConfig, **extra_kwargs):
+def train_rlt(cfg: TrainPipelineConfig):
     """
     Main function for PI05-RLT joint training.
 
-    Accepts extra kwargs:
-      freeze_vla (bool):   freeze VLA, only train RL Token
-      freeze_rlt (bool):   freeze RL Token, only fine-tune VLA
+    Freeze behaviour is controlled via policy config fields:
+      --policy.freeze_vla=true   freeze VLA, only train RL Token encoder/decoder
+      --policy.freeze_rlt=true   freeze RL Token, only fine-tune VLA
     """
-    freeze_vla = extra_kwargs.get("freeze_vla", False)
-    freeze_rlt = extra_kwargs.get("freeze_rlt", False)
+    # Read freeze flags from policy config (set via --policy.freeze_vla / --policy.freeze_rlt)
+    freeze_vla = getattr(cfg.policy, "freeze_vla", False)
+    freeze_rlt = getattr(cfg.policy, "freeze_rlt", False)
 
     cfg.validate()
 
