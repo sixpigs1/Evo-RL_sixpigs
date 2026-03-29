@@ -178,3 +178,5 @@ outputs/
 *.xml
 *.part
 AGENTS.md
+
+.txt
