@@ -369,7 +369,8 @@ class PI05RLTPytorch(PI05Pytorch):
         )
         # prefix_out: (B, N_prefix, vlm_dim)
         # Take the image token positions (first M positions)
-        z_image = prefix_out[:, :M, :]   # (B, M, vlm_dim)  -- final-layer image embeddings
+        # Cast back to float32 for RLT encoder/decoder (which are float32 modules)
+        z_image = prefix_out[:, :M, :].float()   # (B, M, vlm_dim)
 
         # 3. RL Token Encoder -----------------------------------------------------
         rl_token = self.rlt_encoder(z_image)   # (B, rl_token_dim)
@@ -414,7 +415,8 @@ class PI05RLTPytorch(PI05Pytorch):
             inputs_embeds=[prefix_embs, None],
             use_cache=False,
         )
-        z_image = prefix_out[:, :M, :]    # (B, M, vlm_dim)
+        # Cast back to float32 for RLT encoder (which is a float32 module)
+        z_image = prefix_out[:, :M, :].float()    # (B, M, vlm_dim)
 
         rl_token = self.rlt_encoder(z_image)   # (B, rl_token_dim)
         return rl_token
