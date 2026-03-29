@@ -348,13 +348,16 @@ class PI05RLTPytorch(PI05Pytorch):
         prefix_embs, prefix_pad_masks, prefix_att_masks, image_embeddings, M = \
             self._embed_prefix_and_get_image_embeddings(images, img_masks, tokens, masks)
 
+        # Determine the model dtype from the first q_proj weight (bfloat16 / float16 / float32)
+        model_dtype = self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+
+        # Cast embeddings and attention mask to match model dtype (required by SDPA)
+        prefix_embs = prefix_embs.to(dtype=model_dtype)
+
         # Run image embeddings through the VLM's transformer layers to get final-layer embeddings
-        # For efficiency, we re-use the cached prefix computation. For the reconstruction loss,
-        # we only need the image token outputs after VLM processing.
-        # We pass prefix embeddings through the VLM and extract image positions.
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks).to(dtype=model_dtype)
 
         # Forward through PaliGemma language model (prefix only)
         (prefix_out, _), _ = self.paligemma_with_expert.forward(
@@ -396,9 +399,13 @@ class PI05RLTPytorch(PI05Pytorch):
         prefix_embs, prefix_pad_masks, prefix_att_masks, image_embeddings, M = \
             self._embed_prefix_and_get_image_embeddings(images, img_masks, tokens, masks)
 
+        # Cast to model dtype (bfloat16 / float16 / float32) to avoid SDPA dtype mismatch
+        model_dtype = self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+        prefix_embs = prefix_embs.to(dtype=model_dtype)
+
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks).to(dtype=model_dtype)
 
         (prefix_out, _), _ = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
