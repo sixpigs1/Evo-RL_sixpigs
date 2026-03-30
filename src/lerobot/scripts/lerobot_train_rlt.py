@@ -304,12 +304,10 @@ def train_rlt(cfg: TrainPipelineConfig):
             logging.info(colored(f"[RLT] Mode: Joint training, alpha={alpha}", "cyan"))
 
     train_metrics = {
-        "loss":       AverageMeter("loss",       ":.4f"),
-        "loss_vla":   AverageMeter("loss_vla",   ":.4f"),
-        "loss_recon": AverageMeter("loss_recon", ":.4f"),
-        "grad_norm":  AverageMeter("grad_norm",  ":.3f"),
-        "lr":         AverageMeter("lr",         ":0.1e"),
-        "update_s":   AverageMeter("update_s",   ":.3f"),
+        "loss":          AverageMeter("loss",          ":.4f"),
+        "grad_norm":     AverageMeter("grad_norm",     ":.3f"),
+        "lr":            AverageMeter("lr",            ":0.1e"),
+        "update_s":      AverageMeter("update_s",      ":.3f"),
         "dataloading_s": AverageMeter("dataloading_s", ":.3f"),
     }
     effective_bs = cfg.batch_size * accelerator.num_processes
@@ -335,12 +333,6 @@ def train_rlt(cfg: TrainPipelineConfig):
         train_tracker, output_dict = update_policy_rlt(
             train_tracker, policy, batch, optimizer, cfg.optimizer.grad_clip_norm, accelerator, lr_scheduler
         )
-
-        # Update per-component metrics (both stored on tracker and logged to wandb)
-        if output_dict.get("loss_vla") is not None:
-            train_tracker.loss_vla = output_dict["loss_vla"]
-        if output_dict.get("loss_recon") is not None:
-            train_tracker.loss_recon = output_dict["loss_recon"]
 
         step += 1
         train_tracker.step()
