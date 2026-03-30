@@ -64,6 +64,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
 from lerobot.configs import parser
 from lerobot.configs.default import WandBConfig
@@ -106,8 +107,8 @@ class CriticPretrainConfig:
     weight_decay: float = 1e-4
     tau: float = 0.005
     grad_clip_norm: float = 1.0
-    log_freq: int = 100
-    save_freq: int = 2000
+    log_freq: int = 20      # print loss every N steps (lower = more frequent)
+    save_freq: int = 1000
 
     # --- Output ---
     output_dir: str = "outputs/pretrain_critic"
@@ -716,6 +717,12 @@ def pretrain_critic(cfg: CriticPretrainConfig):
     best_loss = float("inf")
     data_iter = iter(dataloader)
 
+    # Exponential moving-average loss for tqdm display (alpha=0.1)
+    _ema_loss: float | None = None
+    _ema_alpha = 0.1
+
+    pbar = tqdm(total=cfg.steps, desc="critic pretrain", unit="step", dynamic_ncols=True)
+
     while step < cfg.steps:
         try:
             batch = next(data_iter)
@@ -736,18 +743,35 @@ def pretrain_critic(cfg: CriticPretrainConfig):
         scheduler.step()
         step += 1
 
+        # Update EMA loss for tqdm postfix
+        raw_loss = metrics["critic_loss"]
+        if _ema_loss is None:
+            _ema_loss = raw_loss
+        else:
+            _ema_loss = _ema_alpha * raw_loss + (1 - _ema_alpha) * _ema_loss
+
+        pbar.update(1)
+        pbar.set_postfix(
+            loss=f"{raw_loss:.4f}",
+            ema=f"{_ema_loss:.4f}",
+            Q1=f"{metrics['q1_mean']:.3f}",
+            Qt=f"{metrics['q_target_mean']:.3f}",
+            lr=f"{optimizer.param_groups[0]['lr']:.1e}",
+        )
+
         if step % cfg.log_freq == 0:
             lr_now = optimizer.param_groups[0]["lr"]
             logging.info(
                 f"  Step {step:6d}/{cfg.steps} | "
-                f"loss={metrics['critic_loss']:.4f} "
-                f"(Q1={metrics['critic_loss_q1']:.4f} Q2={metrics['critic_loss_q2']:.4f}) | "
-                f"Q1={metrics['q1_mean']:.3f} Qt={metrics['q_target_mean']:.3f} | "
+                f"loss={raw_loss:.4f} (ema={_ema_loss:.4f}) | "
+                f"Q1={metrics['critic_loss_q1']:.4f} Q2={metrics['critic_loss_q2']:.4f} | "
+                f"Q1_mean={metrics['q1_mean']:.3f} Qt={metrics['q_target_mean']:.3f} | "
                 f"lr={lr_now:.2e}"
             )
             if wandb_run:
                 wandb_run.log(
-                    {f"train/{k}": v for k, v in metrics.items()} | {"train/lr": lr_now},
+                    {f"train/{k}": v for k, v in metrics.items()}
+                    | {"train/loss_ema": _ema_loss, "train/lr": lr_now},
                     step=step,
                 )
 
@@ -766,10 +790,12 @@ def pretrain_critic(cfg: CriticPretrainConfig):
             p = output_dir / f"critic_step_{step:06d}.pth"
             torch.save(ckpt, p)
             logging.info(f"[CriticPretrain] Saved: {p}")
-            if metrics["critic_loss"] < best_loss:
-                best_loss = metrics["critic_loss"]
+            if raw_loss < best_loss:
+                best_loss = raw_loss
                 torch.save(ckpt, output_dir / "critic_best.pth")
                 logging.info(f"[CriticPretrain] New best (loss={best_loss:.4f})")
+
+    pbar.close()
 
     torch.save(
         {
