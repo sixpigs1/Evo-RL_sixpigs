@@ -221,6 +221,7 @@ lerobot-train-rlt="lerobot.scripts.lerobot_train_rlt:main"
 lerobot-online-rl="lerobot.scripts.lerobot_online_rl:main"
 lerobot-train-mode-switch="lerobot.scripts.lerobot_train_mode_switch:main"
 lerobot-deploy-rlt="lerobot.scripts.lerobot_deploy_rlt:main"
+lerobot-pretrain-critic="lerobot.scripts.lerobot_pretrain_critic:main"
 
 # ---------------- Tool Configurations ----------------
 [tool.setuptools.packages.find]
