@@ -138,6 +138,12 @@ class CriticPretrainConfig:
     # --- Output ---
     output_dir: str = "outputs/pretrain_actor_critic"
 
+    # --- Caching ---
+    # If True and the mmap store already exists (from a previous run with the
+    # same output_dir), skip the VLA extraction pass entirely and reuse the
+    # cached transitions on disk.  Set to False to force re-extraction.
+    cache_mmap_store: bool = True
+
     # --- Memory control ---
     num_workers: int = 0          # 0 = main process; safe for mmap
 
@@ -387,7 +393,7 @@ class MmapCriticDataset(Dataset):
 @torch.no_grad()
 def build_mmap_store(
     dataset: LeRobotDataset,
-    vla_policy: PI05RLTPolicy,
+    vla_policy: Optional[PI05RLTPolicy],
     cfg: CriticPretrainConfig,
     store_dir: Path,
     rl_token_dim: int,
@@ -395,21 +401,61 @@ def build_mmap_store(
     action_dim: int,
 ) -> int:
     """
-    Two-pass streaming extraction:
+    Two-pass streaming extraction.  Only **chunk-boundary frames** are fed to
+    the VLA — specifically the first frame of each chunk (used as s_t) and the
+    first frame of the *next* chunk (used as s_{t+1}).  All intermediate frames
+    within a chunk only need their `state` and `action` values read from the
+    parquet columns; they are never pushed through the VLA encoder.
 
-    Pass 1: count valid transitions (no data loaded, just episode metadata).
-    Pass 2: for each frame, call VLA to get z_rl + ref_action, then del frame.
-            Write (z_rl, state, action, ref_action, ...) directly to mmap.
+    Concretely, for an episode of length T with chunk_size C we produce
+    ``T // C`` transitions.  Each transition needs VLA inference for at most
+    **two** distinct frames (t_start and t_end), and consecutive transitions
+    share their boundary frame, so the total number of VLA calls per episode
+    is at most ``T // C + 1``, not ``T``.
 
-    Memory: at any point only ONE decoded frame + current-episode float strips.
+    Cache behaviour
+    ---------------
+    After a successful extraction a ``meta.npz`` file is written to
+    ``store_dir``.  On subsequent runs, if ``cfg.cache_mmap_store=True``
+    and ``meta.npz`` is present, the whole extraction is skipped and the
+    cached size / dims are returned directly.
     """
+    meta_path = store_dir / "meta.npz"
+
+    # ------------------------------------------------------------------
+    # Cache hit: reuse existing mmap store
+    # ------------------------------------------------------------------
+    if cfg.cache_mmap_store and meta_path.exists():
+        meta = np.load(meta_path)
+        cached_size          = int(meta["size"])
+        cached_rl_token_dim  = int(meta["rl_token_dim"])
+        cached_state_dim     = int(meta["state_dim"])
+        cached_action_dim    = int(meta["action_dim"])
+        cached_chunk_size    = int(meta["chunk_size"])
+        if (
+            cached_rl_token_dim == rl_token_dim
+            and cached_state_dim == state_dim
+            and cached_action_dim == action_dim
+            and cached_chunk_size == cfg.chunk_size
+        ):
+            logging.info(
+                f"[Pretrain] Cache HIT at {store_dir} — "
+                f"reusing {cached_size} transitions (skipping VLA extraction). "
+                f"Set cache_mmap_store=False to force re-extraction."
+            )
+            return cached_size
+        else:
+            logging.warning(
+                "[Pretrain] Cache MISMATCH (dims changed) — re-extracting."
+            )
+
     vla_policy.eval()
     tokenizer_max_len = getattr(vla_policy.config, "tokenizer_max_length", 48)
     chunk_size        = cfg.chunk_size
     num_episodes      = dataset.meta.total_episodes
 
     # ------------------------------------------------------------------
-    # Pass 1: count
+    # Pass 1: count valid transitions (metadata only, no I/O)
     # ------------------------------------------------------------------
     logging.info("[Pretrain] Pass 1/2: counting valid transitions ...")
     ep_info: list[tuple[int, int, int]] = []
@@ -440,63 +486,92 @@ def build_mmap_store(
     )
 
     # ------------------------------------------------------------------
-    # Pass 2: extraction
+    # Pass 2: extraction — only chunk-boundary frames go through VLA
     # ------------------------------------------------------------------
-    logging.info("[Pretrain] Pass 2/2: streaming extraction (z_rl + ref_action) ...")
+    logging.info(
+        "[Pretrain] Pass 2/2: extracting transitions "
+        "(VLA called only on chunk-boundary frames) ..."
+    )
     t0 = time.perf_counter()
 
-    total_frames = sum(to_idx - from_idx for _, from_idx, to_idx in ep_info)
+    # For progress: count boundary frames (not all frames)
+    total_boundary_frames = sum(
+        (to_idx - from_idx) // chunk_size + 1  # at most this many per episode
+        for _, from_idx, to_idx in ep_info
+    )
     ep_bar = tqdm(ep_info, desc="extract episodes", unit="ep", dynamic_ncols=True)
-    frame_bar = tqdm(
-        total=total_frames, desc="  frames", unit="frame",
-        dynamic_ncols=True, leave=False,
+    vla_bar = tqdm(
+        total=total_boundary_frames,
+        desc="  VLA calls",
+        unit="frame",
+        dynamic_ncols=True,
+        leave=False,
     )
 
-    for prog_i, (ep_idx, from_idx, to_idx) in enumerate(ep_bar):
+    for ep_idx, from_idx, to_idx in ep_bar:
         T = to_idx - from_idx
+        num_chunks = T // chunk_size
 
-        # Per-episode float strips (no images — small)
-        rl_tokens_ep  = np.empty((T, rl_token_dim),         dtype=np.float32)
-        ref_actions_ep = np.empty((T, chunk_size, action_dim), dtype=np.float32)
-        states_ep     = np.empty((T, state_dim),             dtype=np.float32)
-        actions_ep    = np.empty((T, action_dim),            dtype=np.float32)
-
+        # ---- Step 1: read states and actions for ALL frames in the episode.
+        # These are cheap parquet column reads — no images, no VLA.
+        states_ep  = np.empty((T, state_dim),  dtype=np.float32)
+        actions_ep = np.empty((T, action_dim), dtype=np.float32)
         for t, abs_idx in enumerate(range(from_idx, to_idx)):
-            frame = dataset[abs_idx]              # decode frame (images in RAM)
+            frame = dataset[abs_idx]
+            states_ep[t]  = _extract_state(frame).numpy()
+            actions_ep[t] = _extract_action(frame).numpy()
+            del frame
 
+        # ---- Step 2: VLA inference only on chunk-boundary frames.
+        # Boundary set = {t_start for each chunk} ∪ {t_end for the last chunk}.
+        # t_end of chunk i == t_start of chunk i+1, so we deduplicate naturally
+        # by building a sorted list of unique boundary indices.
+        boundary_abs: list[int] = []
+        for chunk_i in range(num_chunks):
+            b = from_idx + chunk_i * chunk_size
+            if not boundary_abs or boundary_abs[-1] != b:
+                boundary_abs.append(b)
+        # Also add the final "next" frame (t_end of last chunk, capped at T-1)
+        last_next = from_idx + min(num_chunks * chunk_size, T - 1)
+        if boundary_abs[-1] != last_next:
+            boundary_abs.append(last_next)
+
+        # Map absolute index → (z_rl, ref_action)
+        vla_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        for abs_idx in boundary_abs:
+            frame = dataset[abs_idx]
             z_rl, ref_act = _extract_rl_token_and_ref_action(
                 frame, vla_policy, cfg.device, tokenizer_max_len, action_dim, chunk_size
             )
-            rl_tokens_ep[t]   = z_rl.numpy()
-            ref_actions_ep[t] = ref_act.numpy()
-            states_ep[t]      = _extract_state(frame).numpy()
-            actions_ep[t]     = _extract_action(frame).numpy()
+            vla_cache[abs_idx] = (z_rl.numpy(), ref_act.numpy())
+            del frame
+            vla_bar.update(1)
 
-            del frame                             # free images NOW
-            frame_bar.update(1)
-
-        # Episode success
+        # ---- Step 3: assemble transitions from cached boundary lookups
         if cfg.assume_success:
             ep_success = 1.0
         else:
-            last = dataset[to_idx - 1]
-            ep_success = float(last.get("next.success", last.get("success", 1.0)))
-            del last
+            last_frame = dataset[to_idx - 1]
+            ep_success = float(
+                last_frame.get("next.success", last_frame.get("success", 1.0))
+            )
+            del last_frame
 
-        # Build chunk transitions
-        num_chunks = T // chunk_size
         for chunk_i in range(num_chunks):
-            t_start = chunk_i * chunk_size
-            t_end   = t_start + chunk_size
+            t_start    = chunk_i * chunk_size
+            t_end      = t_start + chunk_size
+            is_last    = (t_end >= T)
+            t_next_loc = min(t_end, T - 1)          # local index within episode
 
-            is_last = (t_end >= T)
-            t_next  = min(t_end, T - 1)
+            abs_start = from_idx + t_start
+            abs_next  = from_idx + t_next_loc
 
-            # Current chunk arrays
-            act_np     = actions_ep[t_start:t_end]          # (C, A)
-            ref_act_np = ref_actions_ep[t_start]             # use frame t_start's ref (C, A)
+            z_cur,  ref_act_cur  = vla_cache[abs_start]
+            z_next, _            = vla_cache[abs_next]
 
-            # Next action chunk: teleop demo at t+C (BC proxy for a')
+            act_np = actions_ep[t_start:t_end]       # (C, A)  teleop demo chunk
+
+            # Next action chunk (BC proxy for a')
             t_ns, t_ne = t_end, min(t_end + chunk_size, T)
             if t_ne - t_ns == chunk_size:
                 next_act_np = actions_ep[t_ns:t_ne]
@@ -505,29 +580,48 @@ def build_mmap_store(
                 next_act_np = np.concatenate([actions_ep[t_ns:t_ne], pad], axis=0)
 
             store.append(
-                rl_token      = rl_tokens_ep[t_start],
+                rl_token      = z_cur,
                 state         = states_ep[t_start],
                 action        = act_np,
-                ref_action    = ref_act_np,
-                next_rl_token = rl_tokens_ep[t_next],
-                next_state    = states_ep[t_next],
+                ref_action    = ref_act_cur,
+                next_rl_token = z_next,
+                next_state    = states_ep[t_next_loc],
                 next_action   = next_act_np,
                 reward        = ep_success if is_last else 0.0,
                 done          = float(is_last),
             )
 
-        del rl_tokens_ep, ref_actions_ep, states_ep, actions_ep
+        del states_ep, actions_ep, vla_cache
 
         elapsed = time.perf_counter() - t0
-        ep_bar.set_postfix(ep=ep_idx, T=T, written=store._size, elapsed=f"{elapsed:.0f}s")
+        ep_bar.set_postfix(
+            ep=ep_idx, T=T,
+            vla_calls=len(boundary_abs),
+            written=store._size,
+            elapsed=f"{elapsed:.0f}s",
+        )
 
-    frame_bar.close()
+    vla_bar.close()
     ep_bar.close()
 
     actual = store.flush_and_close()
     logging.info(
-        f"[Pretrain] Extraction done: {actual} transitions in {time.perf_counter() - t0:.1f}s"
+        f"[Pretrain] Extraction done: {actual} transitions in "
+        f"{time.perf_counter() - t0:.1f}s"
     )
+
+    # ------------------------------------------------------------------
+    # Write cache metadata so next run can skip extraction
+    # ------------------------------------------------------------------
+    np.savez(
+        meta_path,
+        size=actual,
+        rl_token_dim=rl_token_dim,
+        state_dim=state_dim,
+        action_dim=action_dim,
+        chunk_size=chunk_size,
+    )
+    logging.info(f"[Pretrain] Cache metadata written to {meta_path}")
     return actual
 
 
@@ -678,18 +772,27 @@ def pretrain_critic(cfg: CriticPretrainConfig):
         logging.info(f"[Pretrain] WandB: {wandb_run.url}")
 
     # ------------------------------------------------------------------
-    # Load VLA (frozen, eval)
+    # Determine if cache already exists so we can skip VLA loading
     # ------------------------------------------------------------------
-    logging.info(f"[Pretrain] Loading VLA: {cfg.vla_checkpoint}")
-    vla_policy = PI05RLTPolicy.from_pretrained(cfg.vla_checkpoint)
-    vla_policy.to(device).eval()
-    for p in vla_policy.parameters():
-        p.requires_grad = False
-    rl_token_dim = vla_policy.config.rl_token_dim
-    logging.info(f"[Pretrain] VLA loaded (frozen). rl_token_dim={rl_token_dim}")
+    meta_path = store_dir / "meta.npz"
+    cache_valid = False
+    if cfg.cache_mmap_store and meta_path.exists():
+        try:
+            meta = np.load(meta_path)
+            cache_valid = True
+            rl_token_dim = int(meta["rl_token_dim"])
+            state_dim    = int(meta["state_dim"])
+            action_dim   = int(meta["action_dim"])
+            logging.info(
+                f"[Pretrain] Found existing mmap cache at {store_dir}. "
+                f"VLA loading will be skipped."
+            )
+        except Exception as e:
+            logging.warning(f"[Pretrain] Could not read cache meta: {e}. Will re-extract.")
+            cache_valid = False
 
     # ------------------------------------------------------------------
-    # Load dataset
+    # Load dataset (always needed for dims if cache is absent)
     # ------------------------------------------------------------------
     logging.info(f"[Pretrain] Loading dataset: {cfg.dataset_repo_id}")
     ds_kwargs: dict = {"repo_id": cfg.dataset_repo_id}
@@ -701,18 +804,33 @@ def pretrain_critic(cfg: CriticPretrainConfig):
         f"{dataset.meta.total_frames} frames, fps={dataset.fps}"
     )
 
-    first_frame = dataset[0]
-    state_dim   = _extract_state(first_frame).shape[0]
-    action_dim  = _extract_action(first_frame).shape[0]
-    del first_frame
+    if not cache_valid:
+        # Need actual dims from dataset and VLA
+        first_frame = dataset[0]
+        state_dim   = _extract_state(first_frame).shape[0]
+        action_dim  = _extract_action(first_frame).shape[0]
+        del first_frame
+
+        # ------------------------------------------------------------------
+        # Load VLA (frozen, eval) — only needed when extraction is required
+        # ------------------------------------------------------------------
+        logging.info(f"[Pretrain] Loading VLA: {cfg.vla_checkpoint}")
+        vla_policy = PI05RLTPolicy.from_pretrained(cfg.vla_checkpoint)
+        vla_policy.to(device).eval()
+        for p in vla_policy.parameters():
+            p.requires_grad = False
+        rl_token_dim = vla_policy.config.rl_token_dim
+        logging.info(f"[Pretrain] VLA loaded (frozen). rl_token_dim={rl_token_dim}")
+    else:
+        vla_policy = None  # not needed; extraction will be skipped
+
     logging.info(
         f"[Pretrain] state_dim={state_dim}, action_dim={action_dim}, "
         f"chunk_size={cfg.chunk_size}, rl_token_dim={rl_token_dim}"
     )
 
     # ------------------------------------------------------------------
-    # Build mmap store
-    # ------------------------------------------------------------------
+    # Build mmap store (or reuse cache)
     actual_size = build_mmap_store(
         dataset=dataset,
         vla_policy=vla_policy,
