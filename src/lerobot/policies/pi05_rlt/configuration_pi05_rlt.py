@@ -56,12 +56,12 @@ class PI05RLTConfig(PI05Config):
     """
 
     # RL Token encoder/decoder
-    rlt_encoder_layers: int = 4
+    rlt_encoder_layers: int = 5
     rlt_encoder_hidden_dim: int = 512
     rlt_encoder_nheads: int = 8
     rlt_encoder_dropout: float = 0.1
 
-    rlt_decoder_layers: int = 2
+    rlt_decoder_layers: int = 3
     rlt_decoder_hidden_dim: int = 512
     rlt_decoder_nheads: int = 8
     rlt_decoder_dropout: float = 0.1
